@@ -1,0 +1,354 @@
+// Copyright (c) 2026 DIVISION 7 | MI-7 (@divisionseven)
+// SPDX-License-Identifier: MIT
+// Single owner for the registry plus status join (DB-grounded existence).
+// Existence reads opencode.db unconditionally (read-only); the registry is a freshness overlay, never the sole source.
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { ACTIVE_WINDOW_MS, ATTACH_GONE_GRACE_MS, ATTACH_POLL_MS, EVICT_GRACE_MS, RECENCY_TTL_MS } from "./constants.js";
+import { deriveSessionType } from "./expiry.js";
+import { isGenericTitle } from "./identity.js";
+import { loadSqlite } from "./outbox.js";
+import { fetchSinglePortStatusMap, readRegistry, unwrapStatusMap } from "./registry.js";
+import { getAttachSnapshot } from "./attach.js";
+function defaultDbPath() {
+    if (process.env.OPENCODE_MESH_DB_PATH)
+        return process.env.OPENCODE_MESH_DB_PATH;
+    return join(homedir(), ".local", "share", "opencode", "opencode.db");
+}
+let liveClientHolder = null;
+/** Plugin sets its in-process client here at init; tools read live status through it. */
+export function setLiveClient(client) {
+    liveClientHolder = client;
+}
+/**
+ * DB session scrape, read-only; failures yield partial maps, delete zero.
+ * Unions session and session_v2; v2 hosts persist live sessions there only.
+ */
+export async function readDbSessions(dbPath) {
+    const out = {};
+    let db = null;
+    try {
+        const Ctor = await loadSqlite();
+        db = new Ctor(dbPath ?? defaultDbPath(), { readOnly: true });
+        db.exec("PRAGMA busy_timeout = 5000");
+        db.exec("PRAGMA query_only = ON");
+        const readTable = (table) => {
+            try {
+                return db.prepare(`SELECT id, agent, directory, title, time_updated, parent_id FROM ${table}`).all();
+            }
+            catch {
+                // Fallback for stores without parent_id. Every
+                // type defaults to primary, so the fallback never expires early.
+                try {
+                    const legacy = db.prepare(`SELECT id, agent, directory, title, time_updated FROM ${table}`).all();
+                    return legacy.map((r) => ({ ...r, parent_id: null }));
+                }
+                catch {
+                    return [];
+                }
+            }
+        };
+        // v1 first, v2 second, fresher wins on shared ids.
+        for (const r of [...readTable("session"), ...readTable("session_v2")]) {
+            if (typeof r.id === "string" && r.id.length > 0) {
+                const rawTs = typeof r.time_updated === "number" ? r.time_updated : 0;
+                // ms-normalize guard: live rows are ms scale; second-scale values scale
+                // by 1000 so fixtures in seconds badge correctly (no-op live).
+                const dbUpdatedAt = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+                const prev = out[r.id];
+                if (prev && prev.dbUpdatedAt >= dbUpdatedAt)
+                    continue;
+                out[r.id] = {
+                    id: r.id,
+                    agent: typeof r.agent === "string" && r.agent.length > 0 ? r.agent : null,
+                    directory: typeof r.directory === "string" ? r.directory : null,
+                    title: typeof r.title === "string" ? r.title : null,
+                    dbUpdatedAt,
+                    sessionType: deriveSessionType(r.parent_id),
+                };
+            }
+        }
+    }
+    catch {
+        return out;
+    }
+    finally {
+        try {
+            db?.close();
+            // Why: best-effort — DB close failure must not crash the session scrape.
+        }
+        catch { }
+    }
+    return out;
+}
+/**
+ * Tagged DB triple with classified miss; read-only, never throws.
+ * Evidence rides beside verdict for terminal audit lines.
+ */
+export async function readDbTripleDetailed(sessionId, dbPath) {
+    const attempted = dbPath ?? defaultDbPath();
+    let db = null;
+    try {
+        const Ctor = await loadSqlite();
+        db = new Ctor(attempted, { readOnly: true });
+        db.exec("PRAGMA busy_timeout = 5000");
+        db.exec("PRAGMA query_only = ON");
+        let v1Threw = null;
+        let v2Threw = null;
+        const readRow = (table, onThrow) => {
+            try {
+                const stmt = db.prepare(`SELECT agent, model FROM ${table} WHERE id = ? LIMIT 1`);
+                const raw = stmt.get(sessionId);
+                return raw ?? null;
+            }
+            catch (err) {
+                onThrow(err);
+                return null;
+            }
+        };
+        // v1 vocabulary preserved; v2 table fills v2-host gaps. Both throwing
+        // stays db-throw.
+        const v1 = readRow("session", (err) => {
+            v1Threw = err;
+        });
+        const v2 = !v1
+            ? readRow("session_v2", (err) => {
+                v2Threw = err;
+            })
+            : null;
+        const row = v1 ?? v2;
+        if (!row && v1Threw !== null && v2Threw !== null) {
+            const err = v2Threw;
+            return { ok: false, reason: "db-throw", dbPath: attempted, dbCode: codeOf(err), dbError: String(err).slice(0, 300) };
+        }
+        if (!row)
+            return { ok: false, reason: "db-row-absent", dbPath: attempted };
+        return {
+            ok: true,
+            triple: {
+                agent: typeof row.agent === "string" ? row.agent : null,
+                model: typeof row.model === "string" ? row.model : null,
+            },
+        };
+    }
+    catch (err) {
+        return { ok: false, reason: "db-throw", dbPath: attempted, dbCode: codeOf(err), dbError: String(err).slice(0, 300) };
+    }
+    finally {
+        try {
+            db?.close();
+            // Why: best-effort — DB close failure must not crash the triple read.
+        }
+        catch { }
+    }
+}
+/** Non-throwing driver-code read: string codes pass through, all else yields undefined. */
+function codeOf(err) {
+    try {
+        const code = err?.code;
+        return typeof code === "string" ? code : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Narrow receiver triple, read-only; failures yield null for miss fallthrough. */
+export async function readDbTriple(sessionId, dbPath) {
+    try {
+        const detailed = await readDbTripleDetailed(sessionId, dbPath);
+        return detailed.ok ? detailed.triple : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** DB message-leg recency at display time; failures yield empty maps. */
+const recencyCache = new Map();
+export async function readMessageRecency(dbPath) {
+    const key = dbPath ?? defaultDbPath();
+    const hit = recencyCache.get(key);
+    if (hit && Date.now() - hit.at <= RECENCY_TTL_MS)
+        return { ...hit.map };
+    const map = await readMessageRecencyLive(dbPath);
+    recencyCache.set(key, { at: Date.now(), map });
+    return { ...map };
+}
+/** Test seam: drops cached recency so the next read hits the database. */
+export function clearRecencyCache() {
+    recencyCache.clear();
+}
+async function readMessageRecencyLive(dbPath) {
+    const out = {};
+    let db = null;
+    try {
+        const Ctor = await loadSqlite();
+        db = new Ctor(dbPath ?? defaultDbPath(), { readOnly: true });
+        db.exec("PRAGMA busy_timeout = 5000");
+        db.exec("PRAGMA query_only = ON");
+        const merge = (rows) => {
+            for (const r of rows) {
+                if (typeof r.session_id === "string" && r.session_id.length > 0 && typeof r.t === "number" && r.t > 0) {
+                    const t = r.t > 0 && r.t < 1e12 ? r.t * 1000 : r.t;
+                    if (!out[r.session_id] || out[r.session_id] < t)
+                        out[r.session_id] = t;
+                }
+            }
+        };
+        try {
+            merge(db
+                .prepare(`SELECT session_id, MAX(time_updated) AS t FROM message GROUP BY session_id`)
+                .all());
+        }
+        catch { }
+        try {
+            merge(db
+                .prepare(`SELECT session_id, MAX(time_updated) AS t FROM part GROUP BY session_id`)
+                .all());
+        }
+        catch { }
+    }
+    catch {
+        return out;
+    }
+    finally {
+        try {
+            db?.close();
+            // Why: best-effort — DB close failure must not crash the recency read.
+        }
+        catch { }
+    }
+    return out;
+}
+/**
+ * In-process live status where the plugin holder exists. Never a TCP fetch.
+ * Null means unknown, never empty (fail-closed: null deletes zero).
+ */
+export async function readLiveStatus() {
+    try {
+        const c = liveClientHolder;
+        if (!c?.session?.status)
+            return null;
+        const raw = (await c.session.status());
+        return unwrapStatusMap(raw);
+        // Why: best-effort — live status lookup failure degrades to null, not a crash.
+    }
+    catch { }
+    return null;
+}
+/** Union of the TCP single-port view and the in-process view; live wins per id. */
+export function mergeStatus(tcp, live) {
+    if (!tcp && !live)
+        return null;
+    return { ...(tcp ?? {}), ...(live ?? {}) };
+}
+/** TCP status view: v1 single-port map, v1-plus-v2 union only when it misses. */
+export async function readTcpStatus() {
+    const single = await fetchSinglePortStatusMap();
+    // Fast path keeps v1-green behavior (and probe counts) identical; the
+    // union runs solely where the pin is dark, which is exactly the v2 case.
+    // Lazy import keeps discovery free of a module-level back edge.
+    if (single)
+        return single;
+    try {
+        const { activeUnion } = await import("./v2routes.js");
+        return await activeUnion();
+    }
+    catch {
+        return null;
+    }
+}
+function baseRepo(dir) {
+    return dir.split("/").pop() || dir;
+}
+/**
+ * Visible peers from DB plus registry plus live; never hides, one badge each.
+ */
+export function joinSessions(db, reg, status, now = Date.now(), extra) {
+    if (status && Object.keys(status).length === 0)
+        status = null; // db-truth: empty view is unknown, never a delete signal
+    const merged = {};
+    const attachedSet = new Set(extra?.attached ?? []);
+    const ids = new Set([...Object.keys(db), ...Object.keys(reg)]);
+    for (const id of ids) {
+        const entry = reg[id];
+        const row = db[id];
+        const inStatus = !!status && id in status;
+        const regAge = entry && typeof entry.updatedAt === "number" ? now - entry.updatedAt : Number.POSITIVE_INFINITY;
+        const dbAge = row ? now - row.dbUpdatedAt : Number.POSITIVE_INFINITY;
+        let source;
+        if (inStatus)
+            source = "status";
+        else if (status && entry && regAge <= EVICT_GRACE_MS)
+            source = "heartbeat-recent";
+        else if (!status && entry && regAge <= ACTIVE_WINDOW_MS)
+            source = "heartbeat-recent";
+        else if (row && dbAge <= ACTIVE_WINDOW_MS)
+            source = "db-truth";
+        else
+            source = "stale";
+        const e = { ...(entry ?? {}) };
+        if (!e.sessionId)
+            e.sessionId = id;
+        // agent priority: registry non-unknown, then DB non-empty, then unknown.
+        const regAgent = typeof e.agent === "string" ? e.agent : "";
+        if (!regAgent || regAgent === "unknown") {
+            e.agent = row?.agent && row.agent.length > 0 ? row.agent : regAgent || "unknown";
+        }
+        const dir = e.directory ?? e.cwd ?? row?.directory ?? undefined;
+        if (typeof dir === "string" && dir.length > 0) {
+            e.directory = dir;
+            e.cwd = dir;
+            e.repo = e.repo ?? baseRepo(dir);
+        }
+        // Title reads the title column; registry generic plus DB real overwrites description.
+        const regTitle = typeof e.title === "string" ? e.title : undefined;
+        if ((!regTitle || isGenericTitle(regTitle)) && row?.title && !isGenericTitle(row.title)) {
+            e.description = row.title;
+            e.summary = row.title;
+            e.title = row.title;
+        }
+        if (!e.description)
+            e.description = e.summary ?? e.title ?? id.slice(0, 8);
+        const live = inStatus ? status[id]?.type ?? "unknown" : "unknown";
+        const freshest = Math.min(entry && typeof entry.updatedAt === "number" ? entry.updatedAt : Number.POSITIVE_INFINITY, row ? row.dbUpdatedAt : Number.POSITIVE_INFINITY);
+        // Tier inputs ride beside badge: attached, type, and last-action union.
+        const regRec = entry;
+        const attached = attachedSet.has(id) || regRec?.attached === true;
+        const sessionType = row?.sessionType ?? (typeof regRec?.sessionType === "string" ? regRec.sessionType : undefined) ?? "primary";
+        const trackerAt = extra?.lastAction?.[id] ?? (typeof regRec?.lastActionAt === "number" ? regRec.lastActionAt : 0);
+        const msgAt = extra?.messageRecency?.[id] ?? 0;
+        const lastActionAt = Math.max(trackerAt, msgAt, row ? row.dbUpdatedAt : 0);
+        merged[id] = {
+            ...e,
+            live,
+            status: live,
+            liveSource: source,
+            ageSec: freshest === Number.POSITIVE_INFINITY ? 0 : Math.max(0, Math.floor((now - freshest) / 1000)),
+            attached,
+            sessionType,
+            lastActionAt,
+        };
+    }
+    return merged;
+}
+// Snapshot age bound: one missed poll plus the gone-grace the registry path
+// enforces, so the snapshot never outlives its own marker clearing.
+// Exported: the staleness test imports the bound instead of naming a literal.
+export const ATTACH_SNAPSHOT_MAX_AGE_MS = ATTACH_POLL_MS + ATTACH_GONE_GRACE_MS;
+/** Full join for display surfaces: DB existence unconditionally plus registry claims plus live overlay. */
+export async function joinAll(meshRoot, opts) {
+    const reg = await readRegistry(meshRoot);
+    const db = await readDbSessions();
+    const messageRecency = opts?.withRecency === false ? {} : await readMessageRecency();
+    const live = await readLiveStatus();
+    const tcp = await readTcpStatus();
+    const statusMap = mergeStatus(tcp, live);
+    const now = Date.now();
+    // Snapshot tier: fresh snapshot threads through; null, empty, failed-poll,
+    // and stale snapshots all read as empty, so the join degrades to today's
+    // registry-marker behavior instead of showing stale badges.
+    const snap = getAttachSnapshot();
+    const snapAttached = snap !== null && now - snap.at <= ATTACH_SNAPSHOT_MAX_AGE_MS ? snap.attached : [];
+    return { peers: joinSessions(db, reg, statusMap, now, { messageRecency, attached: snapAttached }), statusMap, tcpMap: tcp, degraded: statusMap === null };
+}
+//# sourceMappingURL=discovery.js.map

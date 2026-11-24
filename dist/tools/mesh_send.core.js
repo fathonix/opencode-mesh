@@ -1,0 +1,378 @@
+// Copyright (c) 2026 DIVISION 7 | MI-7 (@divisionseven)
+// SPDX-License-Identifier: MIT
+// Host-free send executor core (no host-SDK imports; V1 shell + V2 adapter delegate here).
+import { OPENCODE_PORT, POST_TIMEOUT_MS, ROUTE_PROBE_TIMEOUT_MS } from "../constants.js";
+import { MeshError } from "../errors.js";
+import { formatMeshPrefix, meshPrefixLength, quarantineText } from "../frontmatter.js";
+import { resolveReceiverWireDetailed } from "../identity.js";
+import { isSilent, resolveNoReply } from "../wake.js";
+import { assertBodySendable, assertSendable } from "../outbox.js";
+import { readRegistry } from "../registry.js";
+import { getServerAuthHeaderSync } from "../serverAuth.js";
+import { activeUnion, fetchV2Active, locateSession, portsToProbeAsync, postV2Prompt, v2RowToTriple, } from "../v2routes.js";
+import { sanitizeSessionId } from "../xdg.js";
+/** Tool description shared by the V1 shell and the V2 adapter (single source). */
+export const MESH_SEND_DESCRIPTION = "Send text to a peer session via mesh (pure TUI prompt_async). The wire carries the receiver agent as observed; attribution stays in the prefix.";
+// Single shared didYouMean builder for both miss paths (resolve-miss + POST-404), deduped slice(0,5).
+function buildDidYouMean(reg) {
+    const rawPeers = Object.values(reg)
+        .map((r) => r.description ??
+        r.summary ??
+        r.title ??
+        (r.agent && r.repo
+            ? `${r.agent}@${r.repo}`
+            : (r.agent ?? r.repo ?? "")))
+        .filter(Boolean);
+    return [...new Set(rawPeers)].slice(0, 5);
+}
+/** Transient direct-leg failures queue for the claim leg; misses stay loud. */
+function isTransientDirectError(err) {
+    if (err instanceof MeshError) {
+        if (err.code === "PEER_BUSY_RETRY")
+            return true;
+        if (err.code === "SERVER_UNAVAILABLE" && typeof err.status === "number" && err.status >= 500)
+            return true;
+        return false;
+    }
+    return true;
+}
+/** Broadcast opt-in gate: exact MESH_BROADCAST=1 only, default-off. Single owner. */
+function isBroadcastEnabled() {
+    return process.env.MESH_BROADCAST === "1";
+}
+/**
+ * Loopback pin: dials only 127.0.0.1 probed ports; registry addresses never
+ * dialed. Probe failure claims instead of throwing, so down servers queue.
+ * v1 status first on the pinned port, then the discovery-led union (a v2
+ * service host binds an ephemeral port, so the pin alone always misses).
+ */
+async function resolveRoute(viaAuth) {
+    try {
+        const headers = {};
+        if (viaAuth)
+            headers.Authorization = viaAuth;
+        const res = await fetch(`http://127.0.0.1:${OPENCODE_PORT}/session/status`, { headers, signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS) });
+        if (res.ok)
+            return { route: "direct", port: OPENCODE_PORT };
+        // Why: degraded leg — any probe failure (timeout, refused, non-ok) claims
+        // instead of throwing, so a down server queues instead of dropping.
+    }
+    catch { }
+    try {
+        // v2-only union: the v1 pin above just missed, so probing it again
+        // would double the send-path status touches the broadcast gate pins.
+        const discovered = await portsToProbeAsync();
+        for (const port of discovered) {
+            if (port === OPENCODE_PORT)
+                continue;
+            try {
+                if (await fetchV2Active(port, viaAuth))
+                    return { route: "direct", port };
+            }
+            catch { }
+        }
+        if (!discovered.includes(OPENCODE_PORT) && (await activeUnion(undefined, viaAuth, { v1: false }))) {
+            return { route: "direct" };
+        }
+    }
+    catch { }
+    return { route: "claim" };
+}
+/**
+ * Loopback POST base for one port; never a registry address. The send leg
+ * resolves the live port first (service record leads, then the pin) so a
+ * direct admit reaches an ephemeral service host instead of queuing.
+ */
+function resolvePostBase(port = OPENCODE_PORT) {
+    return `http://127.0.0.1:${port}`;
+}
+/**
+ * Loopback GET under route-probe conventions; miss reads fallthrough, never throws.
+ */
+export async function fetchDirectRow(peerId, viaAuth, port = OPENCODE_PORT) {
+    try {
+        const headers = {};
+        if (viaAuth)
+            headers.Authorization = viaAuth;
+        const res = await fetch(`${resolvePostBase(port)}/session/${peerId}`, {
+            headers,
+            signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS),
+        });
+        if (res.status !== 200)
+            return { ok: false, reason: "direct-fetch-miss", status: res.status };
+        try {
+            return { ok: true, row: (await res.json()) };
+        }
+        catch {
+            return { ok: false, reason: "direct-parse-fail", status: res.status };
+        }
+    }
+    catch {
+        return { ok: false, reason: "direct-fetch-miss" };
+    }
+}
+/**
+ * Host-free send executor: unicast exact-match delivery plus registry-scoped
+ * broadcast. Guards (broadcast opt-in, 1MB caps, exact resolution) verbatim.
+ */
+export async function executeMeshSend(args, ctx) {
+    const caller = ctx.sessionID;
+    const { target, text, noReply, silent, broadcast } = args;
+    if (!caller)
+        throw new MeshError("PEER_NOT_FOUND", "session.deleted 404: missing caller sessionID");
+    assertSendable(text);
+    // Broadcast opt-in gate (default-off): fail loud before any fan-out —
+    // zero per-peer sends, zero rows queued. Exact MESH_BROADCAST=1 only.
+    if (broadcast || target.trim().toLowerCase() === "all") {
+        if (!isBroadcastEnabled()) {
+            throw new MeshError("BROADCAST_DISABLED", "broadcast disabled by default; set MESH_BROADCAST=1 to enable");
+        }
+    }
+    // deduped outside N — single readRegistry for the whole operation; the one
+    // loopback route probe happens once per operation (broadcast) or once per send.
+    const reg = await readRegistry();
+    // Unicast resolves against the display union (DB existence plus registry
+    // claims): DB-only peers are sendable. Lazy import defers the sqlite edge
+    // to call time, same pattern as mesh_peers (no static sqlite edge).
+    const { joinAll } = await import("../discovery.js");
+    // Send needs existence only; recency badges would full-scan message
+    // tables on every send, so the send union skips them.
+    const { peers: unionPeers } = await joinAll(undefined, { withRecency: false });
+    const registryIds = new Set(Object.keys(reg));
+    for (const [id, peer] of Object.entries(unionPeers)) {
+        if (!(id in reg))
+            reg[id] = peer;
+    }
+    const auth = getServerAuthHeaderSync();
+    const basename = (p) => p.split("/").pop() || p;
+    const q = (s) => s.toLowerCase();
+    const needle = q(target.trim());
+    // Why: exact-only resolution (evaluated at 404 time):
+    // exact session id, or exact full-field agent@repo denoting exactly one
+    // row. Every other shape misses with PEER_NOT_FOUND + didYouMean[0..5].
+    const resolveTarget = () => {
+        const entries = Object.entries(reg);
+        const rawTarget = target.trim();
+        const hit = entries.find(([id]) => id === rawTarget);
+        if (hit)
+            return hit[0];
+        const matches = entries.filter(([, v]) => {
+            const a = q(v.agent ?? "");
+            const repo = q(v.repo ?? basename(v.directory ?? v.cwd ?? ""));
+            return `${a}@${repo}` === needle;
+        });
+        if (matches.length === 1)
+            return matches[0][0];
+        return null;
+    };
+    const directoryFromCtx = ctx.directory;
+    const agentFromCtx = ctx.agent;
+    /**
+     * v2 inject leg: locates the session across probed ports (v1 shape first,
+     * v2 shape next), resolves the receiver triple from the v2 row merged over
+     * the stored entry, and admits via user admission. Returns the wire
+     * id on admit, null when the v2 leg cannot address or reach the target
+     * (caller degrades to claim), and throws the typed miss vocabulary loud.
+     */
+    const sendV2Direct = async (peerId, prefixed, viaAuth, wakeOpts, port) => {
+        // Why: the caller already resolved the live port, so probing that port
+        // first keeps the v2 admit on one horizontal instead of rescanning pins.
+        const located = await locateSession(peerId, port !== undefined ? [port] : undefined, viaAuth);
+        if (!located || located.kind !== "v2")
+            return null;
+        const triple = v2RowToTriple(located.row);
+        const stored = reg[peerId] ?? {};
+        const merged = { ...stored, ...(triple ?? {}) };
+        const resolved = (await resolveReceiverWireDetailed(null, peerId, merged, {
+            directRow: located.row,
+        })).receiver;
+        if (!resolved)
+            return null;
+        const posted = await postV2Prompt(located.port, peerId, prefixed, wakeOpts, viaAuth);
+        if (posted.ok) {
+            const { newMessageId } = await import("../outbox.js");
+            return posted.id ?? newMessageId();
+        }
+        if (posted.status === 404) {
+            const peers = buildDidYouMean(reg);
+            throw new MeshError("PEER_NOT_FOUND", `peer not found: ${peerId}`, {
+                didYouMean: peers,
+            });
+        }
+        if (posted.status === 401)
+            throw new MeshError("UNAUTHORIZED", "unauthorized 401 Basic mismatch");
+        if (posted.status === 413)
+            throw new MeshError("PAYLOAD_TOO_LARGE", "1MB guard 413");
+        if (posted.status === 429)
+            throw new MeshError("PEER_BUSY_RETRY", `peer busy 429: ${peerId}`, {
+                status: 429,
+            });
+        if (posted.status !== undefined)
+            throw new MeshError("SERVER_UNAVAILABLE", `promptAsync failed ${posted.status}`, { status: posted.status });
+        // Network failure without a status degrades to claim like a transient.
+        return null;
+    };
+    const sendDirect = async (peerId, from, msgText, viaAuth, dir, wakeOpts, port) => {
+        // Lazy outbox import at call time (module carries zero static sqlite edges,
+        // so the direct TCP path never touches storage): always-branded wire ID rule.
+        const { newMessageId } = await import("../outbox.js");
+        const fromEntry = reg[from];
+        const senderEntry = fromEntry;
+        const liveAgent = senderEntry && typeof senderEntry.agent === "string" && senderEntry.agent !== "unknown" && senderEntry.agent.length > 0
+            ? senderEntry.agent
+            : null;
+        const fromAgent = agentFromCtx ?? liveAgent ?? fromEntry?.agent ?? "unknown";
+        const verified = liveAgent !== null;
+        const silentBit = isSilent(wakeOpts);
+        const prefixed = `${formatMeshPrefix(fromAgent, from, verified, silentBit)}\n\n${quarantineText(msgText)}`;
+        // Why: single-owned guard — runtime-measured prefix plus body, never estimated.
+        assertSendable(msgText, meshPrefixLength(fromAgent, from, verified, silentBit));
+        // Direct-leg live read feeds resolver live layer; miss falls through to DB.
+        // Unresolvable rows queue for claim leg with full-trail deferred lines.
+        const livePort = port ?? OPENCODE_PORT;
+        const direct = await fetchDirectRow(peerId, viaAuth, livePort);
+        const directRow = direct.ok ? direct.row : null;
+        // Directory fence: wire uses target scope, never sender cwd; unknown falls back.
+        const peerEntry = reg[peerId];
+        const directory = peerEntry?.directory ?? peerEntry?.cwd ?? dir ?? fromEntry?.directory ?? fromEntry?.cwd ?? process.cwd();
+        // Receiver triple uses receiver agent plus model; unresolvable degrades to claim.
+        const receiver = (await resolveReceiverWireDetailed(null, peerId, reg[peerId], { directRow })).receiver;
+        // Identity degrade: unresolvable triple tries the v2 leg (v2 rows carry
+        // agent plus model where the registry learned neither), then queues.
+        if (!receiver)
+            return sendV2Direct(peerId, prefixed, viaAuth, wakeOpts, livePort);
+        const parts = [{ type: "text", text: prefixed }];
+        // Why: no inline send-path sleeps — jitter lives inside queue policy
+        // (claimer busy-wait). Direct admit never waits on peer state.
+        const headers = { "Content-Type": "application/json" };
+        if (viaAuth)
+            headers.Authorization = viaAuth;
+        if (directory)
+            headers["x-opencode-directory"] = encodeURIComponent(directory);
+        const url = `${resolvePostBase(livePort)}/session/${peerId}/prompt_async?directory=${encodeURIComponent(directory)}`;
+        // Always-branded messageID: 204 carries no body, so wire ID is by construction.
+        const body = JSON.stringify({
+            agent: receiver.agent,
+            parts,
+            messageID: newMessageId(),
+            model: receiver.model,
+            ...(receiver.variant !== undefined ? { variant: receiver.variant } : {}),
+            ...resolveNoReply(wakeOpts),
+        });
+        assertBodySendable(Buffer.byteLength(body, "utf8"));
+        let res;
+        try {
+            res = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(POST_TIMEOUT_MS) });
+        }
+        catch (err) {
+            // Transport failure on the v1 leg tries v2 before queuing; a v2 admit
+            // beats a queued row, otherwise the original fault keeps its contract.
+            const admitted = await sendV2Direct(peerId, prefixed, viaAuth, wakeOpts, livePort);
+            if (admitted !== null)
+                return admitted;
+            throw err;
+        }
+        // Why: a v2 host answers the v1 prompt_async path with 405 and the SPA
+        // shell never 204s, so the status itself names the horizontal to retry.
+        if (res.status === 405) {
+            const admitted = await sendV2Direct(peerId, prefixed, viaAuth, wakeOpts, livePort);
+            if (admitted !== null)
+                return admitted;
+            throw new MeshError("SERVER_UNAVAILABLE", `promptAsync failed ${res.status}`, { status: res.status });
+        }
+        if (res.status === 404) {
+            const peers = buildDidYouMean(reg);
+            throw new MeshError("PEER_NOT_FOUND", `peer not found: ${peerId}`, { didYouMean: peers });
+        }
+        if (res.status === 401)
+            throw new MeshError("UNAUTHORIZED", "unauthorized 401 Basic mismatch");
+        if (res.status === 413)
+            throw new MeshError("PAYLOAD_TOO_LARGE", "1MB guard 413");
+        // Every non-204 is typed; 429 retries, others are server-side with raw status.
+        // Upstream 204-only NoContent success; live pair deferred, never superset.
+        if (res.status === 429)
+            throw new MeshError("PEER_BUSY_RETRY", `peer busy 429: ${peerId}`, { status: 429 });
+        if (res.status !== 204)
+            throw new MeshError("SERVER_UNAVAILABLE", `promptAsync failed ${res.status}`, { status: res.status });
+        return JSON.parse(body).messageID;
+    };
+    const sendClaim = async (peerId, from, msgText, fanoutId, wakeOpts) => {
+        const { enqueue } = await import("../outbox.js");
+        const fromEntry = reg[from];
+        const fromAgent = agentFromCtx ?? fromEntry?.agent ?? "unknown";
+        return enqueue({ target_session: peerId, from_session: from, from_agent: fromAgent, text: msgText, broadcast_id: fanoutId, silent: wakeOpts?.silent ?? wakeOpts?.noReply ?? false }, undefined);
+    };
+    const sendIdentical = async (peerId, from, msgText, viaAuth, dir, route, fanoutId, port) => {
+        sanitizeSessionId(peerId);
+        sanitizeSessionId(from);
+        if (route === "direct") {
+            try {
+                const id = await sendDirect(peerId, from, msgText, viaAuth, dir, { silent, noReply }, port);
+                if (id !== null)
+                    return { id, via: "admitted" };
+                // Identity degrade: unresolvable triple queues for claimer with live client.
+            }
+            catch (err) {
+                // Why: transient direct faults queue instead of dropping. Misses
+                // (404, 401) and oversize (413) keep throwing under the exact-only
+                // contract; only 429, 5xx, and network failures fall through.
+                if (!isTransientDirectError(err))
+                    throw err;
+            }
+        }
+        const id = await sendClaim(peerId, from, msgText, fanoutId, { silent, noReply });
+        return { id, via: "queued" };
+    };
+    if (broadcast) {
+        // Why: registry-scoped fan-out — DB-only rows carry no model key, so
+        // union-scoped delivery would fall back on every such id.
+        const peerIds = Object.keys(reg).filter((id) => id !== caller && registryIds.has(id));
+        if (peerIds.length === 0)
+            return { output: JSON.stringify({ broadcast: true, peers: 0, ok: 0, via: "admitted" }) };
+        const { newMessageId: newFanoutId } = await import("../outbox.js");
+        const sharedFanoutId = newFanoutId();
+        const resolvedShared = await resolveRoute(auth);
+        const sharedRoute = resolvedShared.route;
+        const sharedLivePort = resolvedShared.port;
+        const results = [];
+        for (const pid of peerIds) {
+            try {
+                const r = await sendIdentical(pid, caller, text, auth, directoryFromCtx, sharedRoute, sharedFanoutId, sharedLivePort);
+                results.push({ peerId: pid, ok: true, via: r.via, id: r.id });
+            }
+            catch (e) {
+                const code = e?.code ?? (e instanceof MeshError ? e.code : undefined);
+                const status = e?.status ?? (e instanceof MeshError ? e.status : undefined);
+                const didYouMean = e?.didYouMean;
+                results.push({ peerId: pid, ok: false, error: String(e.message ?? e), code, status, didYouMean });
+                // Why: no mid-fanout abort. Every peer reports, even when the
+                // failure is identical across peers; the tail is data, not noise.
+            }
+        }
+        const okCount = results.filter((r) => r.ok).length;
+        const vias = new Set(results.filter((r) => r.ok).map((r) => r.via));
+        const via = vias.size === 1 ? [...vias][0] : "mixed";
+        const failed = results.filter((r) => !r.ok).map((r) => ({ peerId: r.peerId, code: r.code, error: r.error, didYouMean: r.didYouMean }));
+        return {
+            output: JSON.stringify({ broadcast: true, peers: peerIds.length, ok: okCount, failed, via, results }, null, 2),
+        };
+    }
+    else {
+        const resolved = resolveTarget();
+        if (!resolved) {
+            if (Object.keys(reg).length > 0) {
+                const peers = buildDidYouMean(reg);
+                throw new MeshError("PEER_NOT_FOUND", `peer not found: ${target}`, { didYouMean: peers });
+            }
+            else
+                throw new MeshError("PEER_NOT_FOUND", `peer not found: ${target}`, { didYouMean: [] });
+        }
+        const uncast = await resolveRoute(auth);
+        const r = await sendIdentical(resolved, caller, text, auth, directoryFromCtx, uncast.route, undefined, uncast.port);
+        // Why: honest vocabulary — admitted (204) vs queued (row exists); sent:true-on-204 is forbidden, verify via receipt-by-id.
+        const entry = reg[resolved];
+        const title = entry?.title ?? entry?.description ?? entry?.summary ?? resolved.slice(0, 8);
+        return { output: JSON.stringify({ ok: true, via: r.via, target: resolved, title, id: r.id }) };
+    }
+}
+//# sourceMappingURL=mesh_send.core.js.map

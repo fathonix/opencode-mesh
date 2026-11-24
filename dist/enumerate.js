@@ -1,0 +1,82 @@
+// Copyright (c) 2026 DIVISION 7 | MI-7 (@divisionseven)
+// SPDX-License-Identifier: MIT
+// Bounded local server enumeration.
+// Env plus default port in, sightings with fingerprint out; bind-ownership arbitrates incarnations.
+import { createHash } from "node:crypto";
+import { ONE_MB, OPENCODE_PORT } from "./constants.js";
+import { getServerAuthHeader } from "./serverAuth.js";
+import { withDiscoveredPorts } from "./serviceDiscovery.js";
+export const ENUM_MAX_PORTS = 8;
+export const ENUM_TIMEOUT_MS = 1000;
+/** Per-body cap: the probe keeps a hash only, so larger bodies never buffer. */
+export const ENUM_MAX_BODY = ONE_MB;
+export function enumPorts(explicit) {
+    const fromEnv = (process.env.MESH_ENUM_PORTS ?? "")
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
+    const base = explicit && explicit.length > 0 ? explicit : fromEnv.length > 0 ? fromEnv : [OPENCODE_PORT];
+    return [...new Set(base)].slice(0, ENUM_MAX_PORTS);
+}
+/** Read at most ENUM_MAX_BODY bytes; over-cap or unreadable bodies hash empty. */
+async function readBoundedBody(res) {
+    const headerBag = res.headers;
+    const lenRaw = typeof headerBag?.get === "function" ? headerBag.get("content-length") : null;
+    const len = lenRaw === null ? NaN : Number(lenRaw);
+    if (Number.isFinite(len) && len > ENUM_MAX_BODY)
+        return "";
+    const getReader = res.body?.getReader;
+    if (typeof getReader !== "function")
+        return await res.text();
+    const reader = getReader.call(res.body);
+    const chunks = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            total += value?.byteLength ?? 0;
+            if (total > ENUM_MAX_BODY) {
+                await reader.cancel?.().catch(() => { });
+                return "";
+            }
+            if (value)
+                chunks.push(value);
+        }
+    }
+    finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+/** Probe one loopback port; per-port budget keeps hung servers from stalling. */
+export async function probePort(port, timeoutMs = ENUM_TIMEOUT_MS) {
+    const t0 = Date.now();
+    try {
+        const auth = await getServerAuthHeader();
+        const headers = {};
+        if (auth)
+            headers.Authorization = auth;
+        const res = await fetch(`http://127.0.0.1:${port}/session/status`, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        const body = res.ok ? await readBoundedBody(res) : "";
+        return {
+            port,
+            reachable: res.ok,
+            latencyMs: Date.now() - t0,
+            fingerprint: body ? createHash("sha1").update(body).digest("hex") : "",
+            observedAt: Date.now(),
+        };
+    }
+    catch {
+        return { port, reachable: false, latencyMs: Date.now() - t0, fingerprint: "", observedAt: Date.now() };
+    }
+}
+/** Enumerate bounded set concurrently; order follows input, no port-scan sprawl. */
+export async function enumerateServers(explicitPorts, timeoutMs = ENUM_TIMEOUT_MS) {
+    // Discovery folds into the async leg only: a host service record leads the
+    // probe list so an ephemeral service port is found without MESH_ENUM_PORTS.
+    const ports = await withDiscoveredPorts(enumPorts(explicitPorts));
+    return Promise.all(ports.map((p) => probePort(p, timeoutMs)));
+}
+//# sourceMappingURL=enumerate.js.map

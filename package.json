@@ -62,7 +62,8 @@
     "coverage": "vitest run --coverage",
     "harness": "bash scripts/verify-mesh-harness.sh",
     "gc": "node dist/gc.js",
-    "prepublishOnly": "node scripts/gen-version.js && bash scripts/check-todo-publish.sh && npm run typecheck && npm run build"
+    "prepublishOnly": "node scripts/gen-version.js && bash scripts/check-todo-publish.sh && npm run typecheck && npm run build",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.30",
